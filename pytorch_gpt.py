@@ -1,5 +1,6 @@
 import numpy as np
 import torch 
+import torch.nn as nn
 from transformers import AutoTokenizer
 import pickle
 import torch.nn.functional as F
@@ -18,151 +19,135 @@ TOP_P = 0.9
 EPS = 1e-6
 # ----------------
 
-class SingleHeadAttention:
-    def __init__(self, embed_size):
-        self.embed_size = embed_size
-        self.head_size = embed_size // NUM_HEADS
-        self.W_q = torch.randn(embed_size, self.head_size) * 0.01
-        self.W_k = torch.randn(embed_size, self.head_size) * 0.01
-        self.W_v = torch.randn(embed_size, self.head_size) * 0.01
+class SingleHeadAttention(nn.Module):
+    def __init__(self, embed_size, head_size):
+        super().__init__()
+        self.head_size = head_size
+        self.W_q = nn.Linear(embed_size, head_size, bias=False)
+        self.W_k = nn.Linear(embed_size, head_size, bias=False)
+        self.W_v = nn.Linear(embed_size, head_size, bias=False)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_length, embed_size)
-        Q = torch.matmul(x, self.W_q)  # (batch_size, seq_length, head_size)
-        K = torch.matmul(x, self.W_k)  # (batch_size, seq_length, head_size)
-        V = torch.matmul(x, self.W_v)  # (batch_size, seq_length, head_size)
-
-        scores = torch.matmul(Q, K.transpose(0, 2, 1)) / np.sqrt(self.head_size)
-        # masking future tokens
-        for i in range(len(scores)):
-            for j in range(len(scores[i])):
-                if j > i:
-                    scores[i][j] = -1e9  # Masking future tokens
-        weights = self.softmax(scores)
-        out = torch.matmul(weights, V)  # (batch_size, seq_length, head_size)
-
-        # out = torch.matmul(out, self.W_o)  # (batch_size, seq_length, embed_size)
+        Q = self.W_q(x)
+        K = self.W_k(x)
+        V = self.W_v(x)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_size ** 0.5)
+        seq_len = x.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+        scores = scores.masked_fill(mask, float('-inf'))
+        weights = F.softmax(scores, dim=-1)
+        out = torch.matmul(weights, V)
         return out
 
-    def softmax(self, x):
-        e_x = torch.exp(x - torch.max(x, axis=-1, keepdims=True).values)
-        return e_x / e_x.sum(axis=-1, keepdims=True)
-
-class MultiHeadAttention:
+class MultiHeadAttention(nn.Module):
     def __init__(self, embed_size, num_heads):
-        self.heads = [SingleHeadAttention(embed_size) for _ in range(num_heads)]
-        self.W_o = torch.randn(embed_size, embed_size) * 0.01
+        super().__init__()
+        head_size = embed_size // num_heads
+        self.heads = nn.ModuleList([SingleHeadAttention(embed_size, head_size) for _ in range(num_heads)])
+        self.W_o = nn.Linear(embed_size, embed_size, bias=False)
 
     def forward(self, x):
-        prefinal_token = torch.cat([head.forward(x) for head in self.heads], dim=-1)
-        return torch.matmul(prefinal_token, self.W_o)
+        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        return self.W_o(out)
 
-class FeedForwardNetwork:
+class FeedForwardNetwork(nn.Module):
     def __init__(self, embed_size, hidden_size):
-        self.W1 = torch.randn(embed_size, hidden_size) * 0.01
-        self.b1 = torch.zeros((1, hidden_size))
-        self.W2 = torch.randn(hidden_size, embed_size) * 0.01
-        self.b2 = torch.zeros((1, embed_size))
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, embed_size)
+        )
 
     def forward(self, x):
-        z1 = torch.matmul(x, self.W1) + self.b1
-        a1 = torch.maximum(torch.tensor(0.0), z1)  # ReLU activation
-        z2 = torch.matmul(a1, self.W2) + self.b2
-        return z2
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, embed_size, num_heads, hidden_size):
+        super().__init__()
+        self.attn = MultiHeadAttention(embed_size, num_heads)
+        self.ffn = FeedForwardNetwork(embed_size, hidden_size)
+        self.ln1 = nn.LayerNorm(embed_size)
+        self.ln2 = nn.LayerNorm(embed_size)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_heads, hidden_size, num_layers, max_seq_len=1000):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_size = embed_size
+        self.max_seq_len = max_seq_len
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.pos_embedding = nn.Embedding(max_seq_len, embed_size)
+        self.blocks = nn.ModuleList([Block(embed_size, num_heads, hidden_size) for _ in range(num_layers)])
+        self.ln_f = nn.LayerNorm(embed_size)
+        self.lm_head = nn.Linear(embed_size, vocab_size, bias=False)
+        # tie weights
+        self.lm_head.weight = self.embedding.weight
+
+    def forward(self, idx):
+        B, T = idx.shape
+        tok_emb = self.embedding(idx)
+        pos_emb = self.pos_embedding(torch.arange(T, device=idx.device))
+        x = tok_emb + pos_emb
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
     
 
-def embed(tokens, embedding_matrix):
-    return embedding_matrix[tokens]
-
-def LayerNorm(x, eps=EPS):
-    mean = torch.mean(x, axis=-1, keepdims=True)
-    std = torch.std(x, axis=-1, keepdims=True)
-    return (x - mean) / (std + eps)
-
-def forward_pass(tokens):
-    multi_head_attention = MultiHeadAttention(embed_size=EMBED_SIZE, num_heads=NUM_HEADS)
-    H = tokens + multi_head_attention.forward(tokens)
-    normalized_H = LayerNorm(H)
-    ffn = FeedForwardNetwork(embed_size=EMBED_SIZE, hidden_size=HIDDEN_SIZE)
-    O = normalized_H + ffn.forward(normalized_H)
-    normalized_O = LayerNorm(O)
-    return normalized_O
-
-def multi_layer_forward(tokens, num_layers=NUM_LAYERS):
-    for _ in range(num_layers):
-        tokens = forward_pass(tokens)
-    return tokens
-
-def de_embed(tokens, embedding_matrix):
-    return torch.matmul(tokens, embedding_matrix.T)
-
-def logits_to_probs(logits):
-    exp_logits = torch.exp(logits - torch.max(logits, axis=-1, keepdims=True).values)
-    return exp_logits / exp_logits.sum(axis=-1, keepdims=True)
-
-def top_p_sampling(probs, p=TOP_P):
-    sorted_indices = torch.argsort(probs, descending=True)
-    sorted_probs = probs[sorted_indices]
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    cutoff_index = torch.searchsorted(cumulative_probs, p) + 1
-    top_indices = sorted_indices[:cutoff_index]
-    top_probs = sorted_probs[:cutoff_index]
-    top_probs /= top_probs.sum()
-    return torch.multinomial(top_probs, num_samples=1).item()
+def get_batch(split, batch_size, block_size):
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+1+block_size] for i in ix])
+    return x.to(device), y.to(device)
 
 
 if __name__ == "__main__":
-    try:
-        with open("embedding_matrix.pkl", "rb") as f:
-            E = torch.tensor(pickle.load(f))
-    except FileNotFoundError:
-        E = torch.randn(VOCAB_SIZE, EMBED_SIZE) * 0.01  # Example embedding matrix
-        
-    with open("input.txt", "r") as f:
+    with open("corpus.txt", "r") as f:
         input_text = f.read().strip()
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokens = tokenizer(input_text, return_tensors="pt")["input_ids"]
-    embedded_tokens = embed(tokens, E)
-
-    data = torch.tensor(embedded_tokens, dtype=torch.long)
-    n = int(0.9*len(data)) # first 90% will be train, rest val
+    tokens = tokenizer(input_text)["input_ids"]
+    data = torch.tensor(tokens, dtype=torch.long)
+    n = int(0.9 * len(data))
     train_data = data[:n]
     val_data = data[n:]
 
-    # --- Corrected Training Logic ---
+    # Hyperparameters for training
+    block_size = 256
+    num_epochs = 10
+    steps_per_epoch = 100
 
-    # For language modeling, the input is all but the last token
-    x = train_data[:, :-1]
-    # The target is all but the first token (shifted by one)
-    y = train_data[:, 1:]
+    model = GPT(VOCAB_SIZE, EMBED_SIZE, NUM_HEADS, HIDDEN_SIZE, NUM_LAYERS).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # Get model predictions
-    processed_tokens = multi_layer_forward(x)
-    logits = de_embed(processed_tokens, E)
+    # Training loop
+    for epoch in range(num_epochs):
+        for step in range(steps_per_epoch):
+            x, y = get_batch('train', BATCH_SIZE, block_size)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}")
 
-    # Reshape for loss calculation
-    # (batch, seq_length, vocab_size) -> (batch * seq_length, vocab_size)
-    b, t, c = logits.shape
-    logits_for_loss = logits.view(b * t, c)
-    # (batch, seq_length) -> (batch * seq_length)
-    targets = y.view(b * t)
-
-    # Calculate cross-entropy loss
-    loss = F.cross_entropy(logits_for_loss, targets)
-    
-    print(f"Loss: {loss.item()}")
-
-    # --- Generation (Inference) Logic ---
-    # To generate text, you would typically start with a context 
-    # and generate one token at a time in a loop.
-    # This part is simplified for demonstration.
-
-    # Use the logits from the last time step to generate the next token
-    probs = logits_to_probs(logits[:, -1, :]) # Get probs for the last token
-    next_token_generated = top_p_sampling(probs, p=TOP_P)
-    generated_text = tokenizer.decode(next_token_generated.tolist())
-    print("Generated text:", generated_text)
+    # Save weights
+    weights = {
+        'embedding_matrix': model.embedding.weight.cpu().detach(),
+        'multi_head_attention': [block.attn.state_dict() for block in model.blocks],
+        'feed_forward': [block.ffn.state_dict() for block in model.blocks]
+    }
+    with open('model_weights.pkl', 'wb') as f:
+        pickle.dump(weights, f)
+    print("Weights saved to model_weights.pkl")
 
 else:
     print("This script is being imported as a module.")
