@@ -1,0 +1,17 @@
+from datasets import load_dataset
+
+ds = load_dataset("Anthropic/hh-rlhf")
+
+from datasets import load_dataset
+
+ds = load_dataset("starhopp3r/TinyChat") //chinchilan optimal dataset
+
+from datasets import load_dataset
+
+# Login using e.g. `huggingface-cli login` to access this dataset
+ds = load_dataset("ServiceNow-AI/R1-Distill-SFT", "v1") //very large sft dataset so i wont use probably 
+
+from datasets import load_dataset
+
+# Login using e.g. `huggingface-cli login` to access this dataset
+ds = load_dataset("manelalab/ChronoInstruct-SFT-v1") //best sft dataset for my 10m parameter ai training
